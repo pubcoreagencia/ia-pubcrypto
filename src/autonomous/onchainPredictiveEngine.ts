@@ -1,185 +1,201 @@
-/**
- * On-Chain Predictive Intelligence Engine
- * ---------------------------------------
- * Aggregates whale wallet movements, exchange flow deltas, and smart-money
- * accumulation/distribution signals to produce a probabilistic market bias.
- *
- * This module is intentionally dependency-free so it can run inside the
- * autonomous loop (architectEngine.ts) or be invoked from any HTTP route.
- */
+import { EventEmitter } from 'events';
+import { logger } from '../utils/logger';
 
-export type ChainId = 'ethereum' | 'bitcoin' | 'solana' | 'base' | 'arbitrum';
+// ============================================================
+// ON-CHAIN PREDICTIVE ENGINE
+// Real-time exchange flow imbalance detector combined with
+// whale wallet clustering and predictive signal emission.
+// ============================================================
 
-export interface WhaleMovement {
-  wallet: string;
-  chain: ChainId;
-  token: string;
-  amountUsd: number;
-  direction: 'to_exchange' | 'from_exchange' | 'self_custody' | 'unknown';
-  timestamp: number;
-  txHash: string;
-}
-
-export interface SmartMoneySignal {
-  wallet: string;
-  label: string;
-  action: 'accumulate' | 'distribute' | 'hold';
-  confidence: number; // 0..1
-  weight: number;    // historical alpha score
-  timestamp: number;
-}
+export type ChainId = 'bitcoin' | 'ethereum' | 'solana' | 'bsc' | 'polygon';
 
 export interface ExchangeFlow {
   chain: ChainId;
-  token: string;
-  netflowUsd: number; // positive = exchange inflow (bearish), negative = outflow (bullish)
-  window: '1h' | '24h' | '7d';
-}
-
-export interface MarketSnapshot {
-  asset: string;
-  price: number;
-  volatility24h: number;
+  exchange: string;
+  netInflow: number;     // positive = coins entering exchange (sell pressure)
+  netOutflow: number;    // positive = coins leaving exchange (accumulation)
+  largeTxCount: number;  // count of whale-sized transactions (> $1M)
   timestamp: number;
 }
 
-export interface PredictiveReport {
-  asset: string;
-  bias: 'bullish' | 'bearish' | 'neutral';
-  score: number;          // -1..1
-  confidence: number;     // 0..1
-  drivers: string[];
+export interface WhaleCluster {
+  address: string;
+  chain: ChainId;
+  balanceUsd: number;
+  activityScore: number; // 0..100
+  tags: string[];        // e.g. ['fund', 'market-maker', 'dormant']
+}
+
+export interface PredictiveSignal {
+  id: string;
+  chain: ChainId;
+  type: 'accumulation' | 'distribution' | 'whale_rotation' | 'exchange_drain';
+  confidence: number;        // 0..1
+  expectedImpactBps: number; // expected basis points move
+  horizon: '1h' | '4h' | '24h';
+  rationale: string;
   generatedAt: number;
+  expiresAt: number;
 }
 
-export class OnchainPredictiveEngine {
-  private history: Map<string, PredictiveReport[]> = new Map();
+export interface EngineConfig {
+  inflowThresholdUsd: number;
+  outflowThresholdUsd: number;
+  whaleUsdThreshold: number;
+  minClusterSignals: number;
+  signalTtlMs: number;
+}
 
-  /**
-   * Aggregate a market prediction from raw on-chain primitives.
-   */
-  public predict(
-    snapshot: MarketSnapshot,
-    whaleMoves: WhaleMovement[],
-    smartMoney: SmartMoneySignal[],
-    flows: ExchangeFlow[],
-  ): PredictiveReport {
-    const drivers: string[] = [];
-    let score = 0;
-    let weightSum = 0;
+const DEFAULT_CONFIG: EngineConfig = {
+  inflowThresholdUsd: 25_000_000,
+  outflowThresholdUsd: 25_000_000,
+  whaleUsdThreshold: 1_000_000,
+  minClusterSignals: 3,
+  signalTtlMs: 60 * 60 * 1000,
+};
 
-    // 1) Whale flow bias (large movements dominate short-term alpha).
-    const whaleBias = this.scoreWhales(snapshot.asset, whaleMoves);
-    score += whaleBias.value * 0.4;
-    weightSum += 0.4;
-    if (whaleBias.note) drivers.push(whaleBias.note);
+export class OnchainPredictiveEngine extends EventEmitter {
+  private config: EngineConfig;
+  private flows: Map<string, ExchangeFlow[]> = new Map();
+  private clusters: Map<string, WhaleCluster> = new Map();
+  private signals: PredictiveSignal[] = [];
+  private history: PredictiveSignal[] = [];
+  private rollingWindowMs = 24 * 60 * 60 * 1000;
 
-    // 2) Smart money consensus.
-    const smartBias = this.scoreSmartMoney(smartMoney);
-    score += smartBias.value * 0.35;
-    weightSum += 0.35;
-    if (smartBias.note) drivers.push(smartBias.note);
-
-    // 3) Exchange netflow pressure.
-    const flowBias = this.scoreExchangeFlows(snapshot.asset, flows);
-    score += flowBias.value * 0.25;
-    weightSum += 0.25;
-    if (flowBias.note) drivers.push(flowBias.note);
-
-    if (weightSum === 0) weightSum = 1;
-    const normalized = score / weightSum;
-
-    const bias: PredictiveReport['bias'] =
-      normalized > 0.15 ? 'bullish' :
-      normalized < -0.15 ? 'bearish' : 'neutral';
-
-    // Confidence = absolute conviction + sample size bonus.
-    const sampleSize = whaleMoves.length + smartMoney.length + flows.length;
-    const confidence = Math.min(1, Math.abs(normalized) * 0.8 + Math.min(sampleSize, 20) / 40);
-
-    const report: PredictiveReport = {
-      asset: snapshot.asset,
-      bias,
-      score: Number(normalized.toFixed(4)),
-      confidence: Number(confidence.toFixed(4)),
-      drivers,
-      generatedAt: Date.now(),
-    };
-
-    this.record(report);
-    return report;
+  constructor(config: Partial<EngineConfig> = {}) {
+    super();
+    this.config = { ...DEFAULT_CONFIG, ...config };
   }
 
-  public getHistory(asset: string): PredictiveReport[] {
-    return this.history.get(asset.toUpperCase()) ?? [];
+  // ----------------------------------------------------------
+  // Public API
+  // ----------------------------------------------------------
+
+  public ingestFlow(flow: ExchangeFlow): PredictiveSignal[] {
+    const key = `${flow.chain}:${flow.exchange}`;
+    const arr = this.flows.get(key) ?? [];
+    arr.push(flow);
+    this.flows.set(key, this.pruneOld(arr));
+
+    const generated = this.evaluateFlow(flow);
+    generated.forEach((s) => this.registerSignal(s));
+    return generated;
   }
 
-  private record(report: PredictiveReport): void {
-    const key = report.asset.toUpperCase();
-    const list = this.history.get(key) ?? [];
-    list.push(report);
-    if (list.length > 500) list.shift();
-    this.history.set(key, list);
+  public upsertCluster(cluster: WhaleCluster): void {
+    this.clusters.set(cluster.address, cluster);
   }
 
-  private scoreWhales(
-    asset: string,
-    moves: WhaleMovement[],
-  ): { value: number; note?: string } {
-    if (moves.length === 0) return { value: 0 };
-    const target = asset.toUpperCase();
-    let inflow = 0;
-    let outflow = 0;
-    for (const m of moves) {
-      if (m.token.toUpperCase() !== target) continue;
-      if (m.direction === 'to_exchange') inflow += m.amountUsd;
-      else if (m.direction === 'from_exchange' || m.direction === 'self_custody') outflow += m.amountUsd;
+  public getActiveSignals(chain?: ChainId): PredictiveSignal[] {
+    const now = Date.now();
+    return this.signals.filter(
+      (s) => s.expiresAt > now && (!chain || s.chain === chain),
+    );
+  }
+
+  public getSignalAccuracy(): { total: number; hits: number; ratio: number } {
+    const total = this.history.length;
+    if (total === 0) return { total: 0, hits: 0, ratio: 0 };
+    const hits = this.history.filter((s) => (s as any)._resolvedHit).length;
+    return { total, hits, ratio: hits / total };
+  }
+
+  public resolveSignal(signalId: string, hit: boolean): void {
+    const idx = this.signals.findIndex((s) => s.id === signalId);
+    if (idx === -1) return;
+    const [s] = this.signals.splice(idx, 1);
+    (s as any)._resolvedHit = hit;
+    this.history.push(s);
+  }
+
+  // ----------------------------------------------------------
+  // Core logic
+  // ----------------------------------------------------------
+
+  private evaluateFlow(flow: ExchangeFlow): PredictiveSignal[] {
+    const signals: PredictiveSignal[] = [];
+    const imbalance = flow.netOutflow - flow.netInflow;
+
+    // 1. Exchange drain / refill detection
+    if (flow.netOutflow >= this.config.outflowThresholdUsd && imbalance > 0) {
+      signals.push(this.buildSignal(flow, 'exchange_drain', 0.82, 35, '24h',
+        `Exchange ${flow.exchange} on ${flow.chain} draining ${flow.netOutflow.toLocaleString()} USD — historical bullish bias.`));
+    } else if (flow.netInflow >= this.config.inflowThresholdUsd && imbalance < 0) {
+      signals.push(this.buildSignal(flow, 'distribution', 0.74, -28, '24h',
+        `Exchange ${flow.exchange} receiving ${flow.netInflow.toLocaleString()} USD — elevated sell-side pressure.`));
     }
-    const delta = outflow - inflow;
-    const magnitude = Math.max(Math.abs(delta), 1);
-    const value = Math.tanh(delta / magnitude);
+
+    // 2. Whale rotation signal
+    if (flow.largeTxCount >= this.config.minClusterSignals) {
+      const clusterSignal = this.detectWhaleRotation(flow);
+      if (clusterSignal) signals.push(clusterSignal);
+    }
+
+    // 3. Pure accumulation pattern
+    if (flow.netOutflow > flow.netInflow * 2 && flow.netOutflow > 10_000_000) {
+      signals.push(this.buildSignal(flow, 'accumulation', 0.69, 18, '4h',
+        `Net outflow ${(flow.netOutflow - flow.netInflow).toLocaleString()} USD on ${flow.chain} suggests accumulation phase.`));
+    }
+
+    return signals;
+  }
+
+  private detectWhaleRotation(flow: ExchangeFlow): PredictiveSignal | null {
+    const chainClusters = Array.from(this.clusters.values())
+      .filter((c) => c.chain === flow.chain && c.balanceUsd >= this.config.whaleUsdThreshold);
+
+    if (chainClusters.length < this.config.minClusterSignals) return null;
+
+    const active = chainClusters.filter((c) => c.activityScore >= 60);
+    if (active.length === 0) return null;
+
+    const totalBalance = active.reduce((acc, c) => acc + c.balanceUsd, 0);
+    const confidence = Math.min(0.95, 0.55 + active.length * 0.05 + (totalBalance > 500_000_000 ? 0.1 : 0));
+
+    return this.buildSignal(flow, 'whale_rotation', confidence, 22, '4h',
+      `${active.length} whale clusters active on ${flow.chain} with combined exposure ${(totalBalance / 1e9).toFixed(2)}B USD.`);
+  }
+
+  private buildSignal(
+    flow: ExchangeFlow,
+    type: PredictiveSignal['type'],
+    confidence: number,
+    impactBps: number,
+    horizon: PredictiveSignal['horizon'],
+    rationale: string,
+  ): PredictiveSignal {
+    const now = Date.now();
     return {
-      value,
-      note: `Whale flow delta $${delta.toLocaleString()} (${inflow > 0 || outflow > 0 ? 'significant' : 'flat'})`,
+      id: `${flow.chain}-${type}-${now}-${Math.random().toString(36).slice(2, 8)}`,
+      chain: flow.chain,
+      type,
+      confidence: Number(confidence.toFixed(3)),
+      expectedImpactBps: impactBps,
+      horizon,
+      rationale,
+      generatedAt: now,
+      expiresAt: now + this.config.signalTtlMs,
     };
   }
 
-  private scoreSmartMoney(
-    signals: SmartMoneySignal[],
-  ): { value: number; note?: string } {
-    if (signals.length === 0) return { value: 0 };
-    let bull = 0;
-    let bear = 0;
-    let totalWeight = 0;
-    for (const s of signals) {
-      const w = s.weight * s.confidence;
-      totalWeight += w;
-      if (s.action === 'accumulate') bull += w;
-      else if (s.action === 'distribute') bear += w;
-    }
-    if (totalWeight === 0) return { value: 0 };
-    const value = (bull - bear) / totalWeight;
-    return { value, note: `Smart-money consensus ${(value * 100).toFixed(1)}% bullish across ${signals.length} wallets` };
+  private registerSignal(signal: PredictiveSignal): void {
+    this.signals.push(signal);
+    this.emit('signal', signal);
+    logger.info(`[onchain] signal ${signal.type} @ ${signal.chain} conf=${signal.confidence}`);
   }
 
-  private scoreExchangeFlows(
-    asset: string,
-    flows: ExchangeFlow[],
-  ): { value: number; note?: string } {
-    if (flows.length === 0) return { value: 0 };
-    const target = asset.toUpperCase();
-    let net = 0;
-    let count = 0;
-    for (const f of flows) {
-      if (f.token.toUpperCase() !== target) continue;
-      const windowFactor = f.window === '1h' ? 1.5 : f.window === '24h' ? 1.0 : 0.5;
-      net += -f.netflowUsd * windowFactor;
-      count++;
-    }
-    if (count === 0) return { value: 0 };
-    const value = Math.tanh(net / Math.max(Math.abs(net), 1));
-    return { value, note: `Exchange netflow pressure ${(value * 100).toFixed(1)}% (${count} venues)` };
+  private pruneOld(arr: ExchangeFlow[]): ExchangeFlow[] {
+    const cutoff = Date.now() - this.rollingWindowMs;
+    return arr.filter((f) => f.timestamp >= cutoff);
   }
 }
 
-export const onchainPredictiveEngine = new OnchainPredictiveEngine();
+// -----------------------------------------------------------
+// Singleton accessor used by the autonomous runtime
+// -----------------------------------------------------------
+let instance: OnchainPredictiveEngine | null = null;
+
+export function getPredictiveEngine(config?: Partial<EngineConfig>): OnchainPredictiveEngine {
+  if (!instance) instance = new OnchainPredictiveEngine(config);
+  return instance;
+}
